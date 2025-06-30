@@ -11,6 +11,7 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 10000;
 
+// Middleware: JSON for /postgres/ingest, Text for /postgres/ingestCsv
 app.use(bodyParser.json({ limit: '50mb' }));
 app.use(bodyParser.text({ type: 'text/csv', limit: '50mb' }));
 
@@ -64,16 +65,21 @@ app.post('/postgres/ingest', async (req, res) => {
 // ✅ CSV endpoint (for Bulk API Apex integration)
 app.post('/postgres/ingestCsv', async (req, res) => {
   try {
-    const { objectName, csv } = JSON.parse(req.body);
+    const objectName = req.query.objectName;
+    const csv = req.body;
 
     if (!objectName || !csv) {
-      return res.status(400).json({ error: 'Missing objectName or csv' });
+      return res.status(400).json({ error: 'Missing objectName or CSV data' });
     }
 
     const records = csvParser.parse(csv, {
       columns: true,
       skip_empty_lines: true
     });
+
+    if (records.length === 0) {
+      return res.status(400).json({ error: 'No records found in CSV' });
+    }
 
     const columns = Object.keys(records[0]);
 
