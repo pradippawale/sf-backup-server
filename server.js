@@ -19,9 +19,9 @@ app.post('/postgres/ingest', async (req, res) => {
   console.log(`🟡 [DEBUG] CSV size: ${csvData.length} characters`);
 
   const client = new Client({
-    user: 'sfbackupUser',
-    host: 'sf-backup-db.chgsy0sgmkl1.eu-north-1.rds.amazonaws.com',
-    database: 'sf-backup-db',
+    user: 'sfdatabase_user',
+    host: 'dpg-d1ek5bre5dus73bho0ag-a.oregon-postgres.render.com',
+    database: 'sfdatabase',
     password: '8805739771Patil',
     port: 5432,
     ssl: {
