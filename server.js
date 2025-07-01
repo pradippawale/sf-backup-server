@@ -1,76 +1,59 @@
-// -----------------------------
-// 📁 server.js (Node.js Backend)
-// -----------------------------
-
 const express = require('express');
 const bodyParser = require('body-parser');
 const { Client } = require('pg');
-const csvParser = require('csv-parse/sync');
-require('dotenv').config();
 
 const app = express();
-const PORT = process.env.PORT || 10000;
+app.use(bodyParser.json());
 
-// Middleware: JSON for /postgres/ingest, Text for /postgres/ingestCsv
-app.use(bodyParser.json({ limit: '50mb' }));
-app.use(bodyParser.text({ type: 'text/csv', limit: '50mb' }));
-
-// PostgreSQL client
-const client = new Client({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-});
-
-client.connect(err => {
-  if (err) {
-    console.error(' PostgreSQL connection error:', err.stack);
-  } else {
-    console.log('Connected to PostgreSQL!');
-  }
-});
-
-// JSON endpoint (for older Apex logic)
 app.post('/postgres/ingest', async (req, res) => {
-  let { objectName, records, csvData } = req.body;
+  console.log('🔵 [DEBUG] Ingest API hit');
+
+  const { objectName, csvData } = req.body;
+
+  if (!objectName || !csvData) {
+    console.error('🔴 [ERROR] Missing objectName or csvData in request body');
+    return res.status(400).json({ error: 'Missing objectName or csvData' });
+  }
+
+  console.log(`🟡 [DEBUG] Received object: ${objectName}`);
+  console.log(`🟡 [DEBUG] CSV size: ${csvData.length} characters`);
+
+  const client = new Client({
+    user: 'sfbackupUser',
+    host: 'sf-backup-db.chgsy0sgmkl1.eu-north-1.rds.amazonaws.com',
+    database: 'sf-backup-db',
+    password: '8805739771Patil',
+    port: 5432,
+    ssl: {
+      rejectUnauthorized: false, // Allow self-signed certs for dev
+    },
+  });
 
   try {
-    if (!records && csvData) {
-      records = csvParser.parse(csvData, {
-        columns: true,
-        skip_empty_lines: true
-      });
+    console.log('🟠 [DEBUG] Connecting to PostgreSQL...');
+    await client.connect();
+    console.log('🟢 [DEBUG] Connected to PostgreSQL ✅');
+
+    // Example: insert as raw log table (customize as needed)
+    const insertQuery = 'INSERT INTO backup_logs (object_name, csv_data) VALUES ($1, $2)';
+    await client.query(insertQuery, [objectName, csvData]);
+    console.log('✅ [DEBUG] Data inserted successfully');
+
+    res.status(200).json({ status: 'success', message: 'Data saved' });
+  } catch (error) {
+    console.error('🔴 [ERROR] PostgreSQL connection or insert failed:', error);
+    res.status(500).json({ error: 'Failed to insert data into PostgreSQL', details: error.message });
+  } finally {
+    try {
+      await client.end();
+      console.log('🔵 [DEBUG] PostgreSQL connection closed');
+    } catch (err) {
+      console.error('🔴 [ERROR] Error while closing connection:', err);
     }
-
-    if (!objectName || !records || records.length === 0) {
-      return res.status(400).json({ error: 'Invalid payload or empty data' });
-    }
-
-    const columns = Object.keys(records[0]);
-
-    const createTableSQL = `
-      CREATE TABLE IF NOT EXISTS "${objectName}" (
-        ${columns.map(col => `"${col}" TEXT`).join(', ')}
-      );
-    `;
-    await client.query(createTableSQL);
-
-    const placeholders = columns.map((_, i) => `$${i + 1}`).join(', ');
-    const insertSQL = `INSERT INTO "${objectName}" (${columns.map(c => `"${c}"`).join(', ')}) VALUES (${placeholders})`;
-
-    for (const record of records) {
-      const values = columns.map(col => record[col] ?? null);
-      await client.query(insertSQL, values);
-    }
-
-    res.status(200).json({ status: 'success', inserted: records.length });
-  } catch (err) {
-    console.error('Ingest Error:', err.message);
-    res.status(500).json({ error: 'Insert failed', details: err.message });
   }
 });
 
-
-// Start server
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 Server running at https://sf-backup-server.onrender.com (port ${PORT})`);
+  console.log(`🚀 Server listening on port ${PORT}`);
 });
