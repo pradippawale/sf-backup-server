@@ -37,23 +37,11 @@ app.post('/postgres/ingest', async (req, res) => {
     await client.connect();
     console.log('🟢 [DEBUG] Connected to PostgreSQL ✅');
 
-    // ✅ Sanitize objectName to a valid PostgreSQL table name
     const tableName = objectName.toLowerCase().replace(/[^a-z0-9_]/gi, '_');
 
-    const createTableQuery = `
-      CREATE TABLE IF NOT EXISTS "${tableName}" (
-        id SERIAL PRIMARY KEY,
-        row_data JSONB NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-    `;
-    await client.query(createTableQuery);
-    console.log(`🛠️ [DEBUG] Ensured table "${tableName}" exists`);
-
-    // ✅ Convert CSV string to readable stream
     const csvStream = Readable.from([csvData]);
-
     const rows = [];
+
     await new Promise((resolve, reject) => {
       csvStream
         .pipe(csv())
@@ -62,14 +50,41 @@ app.post('/postgres/ingest', async (req, res) => {
         .on('error', reject);
     });
 
+    if (rows.length === 0) {
+      throw new Error('CSV contains no rows');
+    }
+
     console.log(`📄 [DEBUG] Parsed ${rows.length} rows from CSV`);
 
-    // ✅ Insert each row into its object-named table
-    for (const row of rows) {
-      await client.query(
-        `INSERT INTO "${tableName}" (row_data) VALUES ($1)`,
-        [JSON.stringify(row)]
+    // 1️⃣ Extract headers and sanitize
+    let headers = Object.keys(rows[0]);
+    headers = headers.map(h => (h.toLowerCase() === 'id' ? 'sf_id' : h)); // avoid conflict with PK
+    headers = headers.map(h => h.replace(/[^a-zA-Z0-9_]/g, '_').toLowerCase());
+
+    const columnDefs = headers.map(h => `"${h}" TEXT`).join(',\n');
+    const createTableQuery = `
+      CREATE TABLE IF NOT EXISTS "${tableName}" (
+        id SERIAL PRIMARY KEY,
+        ${columnDefs},
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
+    `;
+    await client.query(createTableQuery);
+    console.log(`🛠️ [DEBUG] Created/ensured table "${tableName}" with fields: ${headers.join(', ')}`);
+
+    // 2️⃣ Build insert query
+    const insertQuery = `
+      INSERT INTO "${tableName}" (${headers.map(h => `"${h}"`).join(', ')})
+      VALUES (${headers.map((_, i) => `$${i + 1}`).join(', ')});
+    `;
+
+    // 3️⃣ Insert each row
+    for (const row of rows) {
+      const values = headers.map(h => {
+        const originalKey = h === 'sf_id' ? 'id' : h;
+        return row[originalKey] || '';
+      });
+      await client.query(insertQuery, values);
     }
 
     console.log('✅ [DEBUG] All rows inserted');
