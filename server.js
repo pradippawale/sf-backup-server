@@ -37,16 +37,17 @@ app.post('/postgres/ingest', async (req, res) => {
     await client.connect();
     console.log('🟢 [DEBUG] Connected to PostgreSQL ✅');
 
-    // ✅ Create table to store parsed CSV rows
-    const createTableQuery = `
-      CREATE TABLE IF NOT EXISTS backup_logs (
-        id SERIAL PRIMARY KEY,
-        object_name TEXT NOT NULL,
-        row_data JSONB NOT NULL,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-    `;
-    await client.query(createTableQuery);
+const tableName = objectName.toLowerCase(); // you can also sanitize here
+
+const createTableQuery = `
+  CREATE TABLE IF NOT EXISTS "${tableName}" (
+    id SERIAL PRIMARY KEY,
+    row_data JSONB NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  );
+`;
+await client.query(createTableQuery);
+
     console.log('🛠️ [DEBUG] Ensured backup_logs table exists');
 
     // ✅ Convert CSV string to readable stream
