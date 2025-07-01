@@ -1,9 +1,11 @@
 const express = require('express');
 const bodyParser = require('body-parser');
 const { Client } = require('pg');
+const { Readable } = require('stream');
+const csv = require('csv-parser');
 
 const app = express();
-app.use(bodyParser.json());
+app.use(bodyParser.json({ limit: '10mb' }));
 
 app.post('/postgres/ingest', async (req, res) => {
   console.log('🔵 [DEBUG] Ingest API hit');
@@ -19,14 +21,15 @@ app.post('/postgres/ingest', async (req, res) => {
   console.log(`🟡 [DEBUG] CSV size: ${csvData.length} characters`);
 
   const client = new Client({
-    user: 'sfdatabase_user',
-    host: 'dpg-d1ek5bre5dus73bho0ag-a.oregon-postgres.render.com',
-    database: 'sfdatabase',
-    password: '8805739771Patil',
+    user: 'sfdatabaseuser',
+    host: 'dpg-d1i3u8fdiees73cf0dug-a.oregon-postgres.render.com',
+    database: 'sfdatabase_34oi',
+    password: 'D898TUsAal4ksBUs5QoQffxMZ6MY5aAH',
     port: 5432,
     ssl: {
-      rejectUnauthorized: false, // Allow self-signed certs for dev
-    },
+  require: true,
+  rejectUnauthorized: false
+},
   });
 
   try {
@@ -34,15 +37,46 @@ app.post('/postgres/ingest', async (req, res) => {
     await client.connect();
     console.log('🟢 [DEBUG] Connected to PostgreSQL ✅');
 
-    // Example: insert as raw log table (customize as needed)
-    const insertQuery = 'INSERT INTO backup_logs (object_name, csv_data) VALUES ($1, $2)';
-    await client.query(insertQuery, [objectName, csvData]);
-    console.log('✅ [DEBUG] Data inserted successfully');
+    // ✅ Create table to store parsed CSV rows
+    const createTableQuery = `
+      CREATE TABLE IF NOT EXISTS backup_logs (
+        id SERIAL PRIMARY KEY,
+        object_name TEXT NOT NULL,
+        row_data JSONB NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `;
+    await client.query(createTableQuery);
+    console.log('🛠️ [DEBUG] Ensured backup_logs table exists');
 
-    res.status(200).json({ status: 'success', message: 'Data saved' });
+    // ✅ Convert CSV string to readable stream
+    const csvStream = Readable.from([csvData]);
+
+    const rows = [];
+    await new Promise((resolve, reject) => {
+      csvStream
+        .pipe(csv())
+        .on('data', (row) => rows.push(row))
+        .on('end', resolve)
+        .on('error', reject);
+    });
+
+    console.log(`📄 [DEBUG] Parsed ${rows.length} rows from CSV`);
+
+    // ✅ Insert each row as JSONB
+    for (const row of rows) {
+      await client.query(
+        'INSERT INTO backup_logs (object_name, row_data) VALUES ($1, $2)',
+        [objectName, JSON.stringify(row)]
+      );
+    }
+
+    console.log('✅ [DEBUG] All rows inserted');
+
+    res.status(200).json({ status: 'success', message: `${rows.length} rows saved` });
   } catch (error) {
-    console.error('🔴 [ERROR] PostgreSQL connection or insert failed:', error);
-    res.status(500).json({ error: 'Failed to insert data into PostgreSQL', details: error.message });
+    console.error('🔴 [ERROR] Failed to insert data:', error);
+    res.status(500).json({ error: 'Failed to insert parsed CSV data', details: error.message });
   } finally {
     try {
       await client.end();
