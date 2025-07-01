@@ -17,6 +17,9 @@ app.post('/postgres/ingest', async (req, res) => {
     return res.status(400).json({ error: 'Missing objectName or csvData' });
   }
 
+  console.log(`🟡 [DEBUG] Received object: ${objectName}`);
+  console.log(`🟡 [DEBUG] CSV size: ${csvData.length} characters`);
+
   const client = new Client({
     user: 'sfdatabaseuser',
     host: 'dpg-d1i3u8fdiees73cf0dug-a.oregon-postgres.render.com',
@@ -26,7 +29,7 @@ app.post('/postgres/ingest', async (req, res) => {
     ssl: {
       require: true,
       rejectUnauthorized: false
-    }
+    },
   });
 
   try {
@@ -34,47 +37,43 @@ app.post('/postgres/ingest', async (req, res) => {
     await client.connect();
     console.log('🟢 [DEBUG] Connected to PostgreSQL ✅');
 
+    // ✅ Sanitize objectName to a valid PostgreSQL table name
     const tableName = objectName.toLowerCase().replace(/[^a-z0-9_]/gi, '_');
 
-    const csvStream = Readable.from([csvData]);
-    let headers = [];
-    const rows = [];
+    const createTableQuery = `
+      CREATE TABLE IF NOT EXISTS "${tableName}" (
+        id SERIAL PRIMARY KEY,
+        row_data JSONB NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `;
+    await client.query(createTableQuery);
+    console.log(`🛠️ [DEBUG] Ensured table "${tableName}" exists`);
 
+    // ✅ Convert CSV string to readable stream
+    const csvStream = Readable.from([csvData]);
+
+    const rows = [];
     await new Promise((resolve, reject) => {
       csvStream
         .pipe(csv())
-        .on('headers', (hdrs) => {
-          headers = hdrs.map(h => h.toLowerCase().replace(/[^a-z0-9_]/gi, '_'));
-        })
         .on('data', (row) => rows.push(row))
         .on('end', resolve)
         .on('error', reject);
     });
 
-    console.log(`📄 [DEBUG] Parsed ${rows.length} rows with headers: ${headers}`);
+    console.log(`📄 [DEBUG] Parsed ${rows.length} rows from CSV`);
 
-    const columnsSQL = headers.map(col => `"${col}" TEXT`).join(',\n');
-    const createTableQuery = `
-      CREATE TABLE IF NOT EXISTS "${tableName}" (
-        id SERIAL PRIMARY KEY,
-        ${columnsSQL},
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      );
-    `;
-    await client.query(createTableQuery);
-    console.log(`🛠️ [DEBUG] Created table "${tableName}" with columns: ${headers.join(', ')}`);
-
+    // ✅ Insert each row into its object-named table
     for (const row of rows) {
-      const values = headers.map(col => row[col] || '');
-      const placeholders = headers.map((_, i) => `$${i + 1}`).join(', ');
-      const insertQuery = `
-        INSERT INTO "${tableName}" (${headers.map(h => `"${h}"`).join(', ')})
-        VALUES (${placeholders})
-      `;
-      await client.query(insertQuery, values);
+      await client.query(
+        `INSERT INTO "${tableName}" (row_data) VALUES ($1)`,
+        [JSON.stringify(row)]
+      );
     }
 
     console.log('✅ [DEBUG] All rows inserted');
+
     res.status(200).json({ status: 'success', message: `${rows.length} rows saved to ${tableName}` });
   } catch (error) {
     console.error('🔴 [ERROR] Failed to insert data:', error);
