@@ -27,9 +27,9 @@ app.post('/postgres/ingest', async (req, res) => {
     password: 'D898TUsAal4ksBUs5QoQffxMZ6MY5aAH',
     port: 5432,
     ssl: {
-  require: true,
-  rejectUnauthorized: false
-},
+      require: true,
+      rejectUnauthorized: false
+    },
   });
 
   try {
@@ -37,18 +37,18 @@ app.post('/postgres/ingest', async (req, res) => {
     await client.connect();
     console.log('🟢 [DEBUG] Connected to PostgreSQL ✅');
 
-const tableName = objectName.toLowerCase(); // you can also sanitize here
+    // ✅ Sanitize objectName to a valid PostgreSQL table name
+    const tableName = objectName.toLowerCase().replace(/[^a-z0-9_]/gi, '_');
 
-const createTableQuery = `
-  CREATE TABLE IF NOT EXISTS "${tableName}" (
-    id SERIAL PRIMARY KEY,
-    row_data JSONB NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-  );
-`;
-await client.query(createTableQuery);
-
-    console.log('🛠️ [DEBUG] Ensured backup_logs table exists');
+    const createTableQuery = `
+      CREATE TABLE IF NOT EXISTS "${tableName}" (
+        id SERIAL PRIMARY KEY,
+        row_data JSONB NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `;
+    await client.query(createTableQuery);
+    console.log(`🛠️ [DEBUG] Ensured table "${tableName}" exists`);
 
     // ✅ Convert CSV string to readable stream
     const csvStream = Readable.from([csvData]);
@@ -64,17 +64,17 @@ await client.query(createTableQuery);
 
     console.log(`📄 [DEBUG] Parsed ${rows.length} rows from CSV`);
 
-    // ✅ Insert each row as JSONB
+    // ✅ Insert each row into its object-named table
     for (const row of rows) {
       await client.query(
-        'INSERT INTO backup_logs (object_name, row_data) VALUES ($1, $2)',
-        [objectName, JSON.stringify(row)]
+        `INSERT INTO "${tableName}" (row_data) VALUES ($1)`,
+        [JSON.stringify(row)]
       );
     }
 
     console.log('✅ [DEBUG] All rows inserted');
 
-    res.status(200).json({ status: 'success', message: `${rows.length} rows saved` });
+    res.status(200).json({ status: 'success', message: `${rows.length} rows saved to ${tableName}` });
   } catch (error) {
     console.error('🔴 [ERROR] Failed to insert data:', error);
     res.status(500).json({ error: 'Failed to insert parsed CSV data', details: error.message });
