@@ -13,8 +13,12 @@ app.post('/postgres/ingest', async (req, res) => {
   const { objectName, csvData } = req.body;
 
   if (!objectName || !csvData) {
+    console.error('🔴 [ERROR] Missing objectName or csvData in request body');
     return res.status(400).json({ error: 'Missing objectName or csvData' });
   }
+
+  console.log(`🟡 [DEBUG] Received object: ${objectName}`);
+  console.log(`🟡 [DEBUG] CSV size: ${csvData.length} characters`);
 
   const client = new Client({
     user: 'sfdatabaseuser',
@@ -22,75 +26,80 @@ app.post('/postgres/ingest', async (req, res) => {
     database: 'sfdatabase_34oi',
     password: 'D898TUsAal4ksBUs5QoQffxMZ6MY5aAH',
     port: 5432,
-    ssl: { require: true, rejectUnauthorized: false },
+    ssl: {
+      require: true,
+      rejectUnauthorized: false
+    },
   });
 
   try {
-    console.log(`🟡 [DEBUG] Received object: ${objectName}`);
-    console.log(`🟡 [DEBUG] CSV size: ${csvData.length} characters`);
-
+    console.log('🟠 [DEBUG] Connecting to PostgreSQL...');
     await client.connect();
     console.log('🟢 [DEBUG] Connected to PostgreSQL ✅');
 
     const tableName = objectName.toLowerCase().replace(/[^a-z0-9_]/gi, '_');
 
-    // Parse CSV and get rows and headers
     const csvStream = Readable.from([csvData]);
     const rows = [];
-    const headersSet = new Set();
 
     await new Promise((resolve, reject) => {
       csvStream
         .pipe(csv())
-        .on('headers', (headers) => headers.forEach((h) => headersSet.add(h.toLowerCase().replace(/[^a-z0-9_]/gi, '_'))))
         .on('data', (row) => rows.push(row))
         .on('end', resolve)
         .on('error', reject);
     });
 
-    const headers = [...headersSet];
-    console.log(`📄 [DEBUG] Parsed ${rows.length} rows with ${headers.length} columns`);
+    if (rows.length === 0) {
+      throw new Error('CSV contains no rows');
+    }
 
-    // Dynamically build CREATE TABLE
-    const columnsDDL = headers.map(h => `"${h}" TEXT`).join(', ');
+    console.log(`📄 [DEBUG] Parsed ${rows.length} rows from CSV`);
+
+    // 1️⃣ Extract headers and sanitize
+    let headers = Object.keys(rows[0]);
+    headers = headers.map(h => (h.toLowerCase() === 'id' ? 'sf_id' : h)); // avoid conflict with PK
+    headers = headers.map(h => h.replace(/[^a-zA-Z0-9_]/g, '_').toLowerCase());
+
+    const columnDefs = headers.map(h => `"${h}" TEXT`).join(',\n');
     const createTableQuery = `
       CREATE TABLE IF NOT EXISTS "${tableName}" (
         id SERIAL PRIMARY KEY,
-        ${columnsDDL}
+        ${columnDefs},
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `;
     await client.query(createTableQuery);
     console.log(`🛠️ [DEBUG] Created/ensured table "${tableName}" with fields: ${headers.join(', ')}`);
 
-    // Insert each row
+    // 2️⃣ Build insert query
+    const insertQuery = `
+      INSERT INTO "${tableName}" (${headers.map(h => `"${h}"`).join(', ')})
+      VALUES (${headers.map((_, i) => `$${i + 1}`).join(', ')});
+    `;
+
+    // 3️⃣ Insert each row
     for (const row of rows) {
-      const columns = [];
-      const values = [];
-      const placeholders = [];
-
-      let i = 1;
-      for (const key of headers) {
-        const value = row[key] || row[Object.keys(row).find(k => k.toLowerCase().replace(/[^a-z0-9_]/gi, '_') === key)];
-        columns.push(`"${key}"`);
-        values.push(value ?? null);
-        placeholders.push(`$${i++}`);
-      }
-
-      const insertQuery = `
-        INSERT INTO "${tableName}" (${columns.join(', ')})
-        VALUES (${placeholders.join(', ')})
-      `;
+      const values = headers.map(h => {
+        const originalKey = h === 'sf_id' ? 'id' : h;
+        return row[originalKey] || '';
+      });
       await client.query(insertQuery, values);
     }
 
     console.log('✅ [DEBUG] All rows inserted');
-    res.status(200).json({ status: 'success', message: `${rows.length} rows inserted into ${tableName}` });
+
+    res.status(200).json({ status: 'success', message: `${rows.length} rows saved to ${tableName}` });
   } catch (error) {
     console.error('🔴 [ERROR] Failed to insert data:', error);
     res.status(500).json({ error: 'Failed to insert parsed CSV data', details: error.message });
   } finally {
-    await client.end();
-    console.log('🔵 [DEBUG] PostgreSQL connection closed');
+    try {
+      await client.end();
+      console.log('🔵 [DEBUG] PostgreSQL connection closed');
+    } catch (err) {
+      console.error('🔴 [ERROR] Error while closing connection:', err);
+    }
   }
 });
 
