@@ -17,6 +17,7 @@ app.post('/postgres/ingest', async (req, res) => {
     return res.status(400).json({ error: 'Missing objectName or csvData' });
   }
 
+  const tableName = objectName.toLowerCase().replace(/[^a-z0-9_]/gi, '_');
   console.log(`🟡 [DEBUG] Received object: ${objectName}`);
   console.log(`🟡 [DEBUG] CSV size: ${csvData.length} characters`);
 
@@ -26,22 +27,15 @@ app.post('/postgres/ingest', async (req, res) => {
     database: 'sfdatabase_34oi',
     password: 'D898TUsAal4ksBUs5QoQffxMZ6MY5aAH',
     port: 5432,
-    ssl: {
-      require: true,
-      rejectUnauthorized: false
-    },
+    ssl: { require: true, rejectUnauthorized: false },
   });
 
   try {
-    console.log('🟠 [DEBUG] Connecting to PostgreSQL...');
     await client.connect();
     console.log('🟢 [DEBUG] Connected to PostgreSQL ✅');
 
-    const tableName = objectName.toLowerCase().replace(/[^a-z0-9_]/gi, '_');
-
     const csvStream = Readable.from([csvData]);
     const rows = [];
-
     await new Promise((resolve, reject) => {
       csvStream
         .pipe(csv())
@@ -50,45 +44,58 @@ app.post('/postgres/ingest', async (req, res) => {
         .on('error', reject);
     });
 
-    if (rows.length === 0) {
-      throw new Error('CSV contains no rows');
-    }
-
     console.log(`📄 [DEBUG] Parsed ${rows.length} rows from CSV`);
 
-    // 1️⃣ Extract headers and sanitize
-    let headers = Object.keys(rows[0]);
-    headers = headers.map(h => (h.toLowerCase() === 'id' ? 'sf_id' : h)); // avoid conflict with PK
-    headers = headers.map(h => h.replace(/[^a-zA-Z0-9_]/g, '_').toLowerCase());
+    if (rows.length === 0) throw new Error('CSV is empty');
 
-    const columnDefs = headers.map(h => `"${h}" TEXT`).join(',\n');
+    // Rename 'Id' to 'objectname_id'
+    const objectIdColumnName = `${tableName}_id`;
+
+    const originalHeaders = Object.keys(rows[0]);
+    const headerMap = {};
+
+    const normalizedHeaders = originalHeaders.map((h) => {
+      let clean = h.toLowerCase().replace(/[^a-z0-9_]/gi, '_');
+      if (clean === 'id') {
+        clean = objectIdColumnName;
+      }
+      headerMap[h] = clean;
+      return clean;
+    });
+
+    // Build CREATE TABLE SQL
+    const columnDefinitions = normalizedHeaders.map((col) => `"${col}" TEXT`);
     const createTableQuery = `
       CREATE TABLE IF NOT EXISTS "${tableName}" (
-        id SERIAL PRIMARY KEY,
-        ${columnDefs},
+        ${columnDefinitions.join(', ')},
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       );
     `;
     await client.query(createTableQuery);
-    console.log(`🛠️ [DEBUG] Created/ensured table "${tableName}" with fields: ${headers.join(', ')}`);
+    console.log(`🛠️ [DEBUG] Created/ensured table "${tableName}" with fields: ${normalizedHeaders.join(', ')}`);
 
-    // 2️⃣ Build insert query
-    const insertQuery = `
-      INSERT INTO "${tableName}" (${headers.map(h => `"${h}"`).join(', ')})
-      VALUES (${headers.map((_, i) => `$${i + 1}`).join(', ')});
-    `;
-
-    // 3️⃣ Insert each row
+    // Insert data
     for (const row of rows) {
-      const values = headers.map(h => {
-        const originalKey = h === 'sf_id' ? 'id' : h;
-        return row[originalKey] || '';
-      });
+      const columns = [];
+      const values = [];
+      const placeholders = [];
+
+      let i = 1;
+      for (const originalKey of originalHeaders) {
+        const normalizedKey = headerMap[originalKey];
+        columns.push(`"${normalizedKey}"`);
+        values.push(row[originalKey]);
+        placeholders.push(`$${i++}`);
+      }
+
+      const insertQuery = `
+        INSERT INTO "${tableName}" (${columns.join(', ')})
+        VALUES (${placeholders.join(', ')})
+      `;
       await client.query(insertQuery, values);
     }
 
-    console.log('✅ [DEBUG] All rows inserted');
-
+    console.log(`✅ [DEBUG] Inserted ${rows.length} rows into "${tableName}"`);
     res.status(200).json({ status: 'success', message: `${rows.length} rows saved to ${tableName}` });
   } catch (error) {
     console.error('🔴 [ERROR] Failed to insert data:', error);
