@@ -5,7 +5,7 @@ const { Readable } = require('stream');
 const csv = require('csv-parser');
 
 const app = express();
-app.use(bodyParser.json({ limit: '10mb' }));
+app.use(bodyParser.json({ limit: '20mb' })); // Increase payload limit if needed
 
 app.post('/postgres/ingest', async (req, res) => {
   console.log('🔵 [DEBUG] Ingest API hit');
@@ -19,7 +19,15 @@ app.post('/postgres/ingest', async (req, res) => {
 
   const tableName = objectName.toLowerCase().replace(/[^a-z0-9_]/gi, '_');
   console.log(`🟡 [DEBUG] Received object: ${objectName}`);
-  console.log(`🟡 [DEBUG] CSV size: ${csvData.length} characters`);
+
+  // Decode base64-encoded CSV from Salesforce
+  let rawCsv;
+  try {
+    rawCsv = Buffer.from(csvData, 'base64').toString('utf-8');
+  } catch (decodeError) {
+    console.error('🔴 [ERROR] Failed to decode base64 CSV:', decodeError);
+    return res.status(400).json({ error: 'Invalid base64 CSV data' });
+  }
 
   const client = new Client({
     user: 'sfdatabaseuser',
@@ -34,8 +42,9 @@ app.post('/postgres/ingest', async (req, res) => {
     await client.connect();
     console.log('🟢 [DEBUG] Connected to PostgreSQL ✅');
 
-    const csvStream = Readable.from([csvData]);
+    const csvStream = Readable.from([rawCsv]);
     const rows = [];
+
     await new Promise((resolve, reject) => {
       csvStream
         .pipe(csv())
@@ -46,20 +55,26 @@ app.post('/postgres/ingest', async (req, res) => {
 
     console.log(`📄 [DEBUG] Parsed ${rows.length} rows from CSV`);
 
-    if (rows.length === 0) throw new Error('CSV is empty');
+    if (rows.length === 0) {
+      throw new Error('CSV is empty');
+    }
 
-    // Normalize headers and map them
-    const firstRow = rows[0];
+    // Rename 'Id' to '<objectname>_id' and normalize headers
+    const objectIdColumnName = `${tableName}_id`;
+    const originalHeaders = Object.keys(rows[0]);
     const headerMap = {};
-    const normalizedHeaders = Object.keys(firstRow).map((originalHeader) => {
-      let cleanHeader = originalHeader.toLowerCase().replace(/[^a-z0-9_]/gi, '_');
-      if (cleanHeader === 'id') cleanHeader = `${tableName}_id`;
-      headerMap[originalHeader] = cleanHeader;
-      return cleanHeader;
+
+    const normalizedHeaders = originalHeaders.map((h) => {
+      let clean = h.toLowerCase().replace(/[^a-z0-9_]/gi, '_');
+      if (clean === 'id') {
+        clean = objectIdColumnName;
+      }
+      headerMap[h] = clean;
+      return clean;
     });
 
     // Create table if not exists
-    const columnDefinitions = normalizedHeaders.map(col => `"${col}" TEXT`);
+    const columnDefinitions = normalizedHeaders.map((col) => `"${col}" TEXT`);
     const createTableQuery = `
       CREATE TABLE IF NOT EXISTS "${tableName}" (
         ${columnDefinitions.join(', ')},
@@ -67,16 +82,16 @@ app.post('/postgres/ingest', async (req, res) => {
       );
     `;
     await client.query(createTableQuery);
-    console.log(`🛠️ [DEBUG] Created/ensured table "${tableName}" with fields: ${normalizedHeaders.join(', ')}`);
+    console.log(`🛠️ [DEBUG] Ensured table "${tableName}" exists.`);
 
-    // Insert each row
+    // Insert rows
     for (const row of rows) {
       const columns = [];
       const values = [];
       const placeholders = [];
 
       let i = 1;
-      for (const originalKey of Object.keys(firstRow)) {
+      for (const originalKey of originalHeaders) {
         const normalizedKey = headerMap[originalKey];
         columns.push(`"${normalizedKey}"`);
         values.push(row[originalKey]);
@@ -85,16 +100,20 @@ app.post('/postgres/ingest', async (req, res) => {
 
       const insertQuery = `
         INSERT INTO "${tableName}" (${columns.join(', ')})
-        VALUES (${placeholders.join(', ')});
+        VALUES (${placeholders.join(', ')})
       `;
       await client.query(insertQuery, values);
     }
 
     console.log(`✅ [DEBUG] Inserted ${rows.length} rows into "${tableName}"`);
-    res.status(200).json({ status: 'success', message: `${rows.length} rows saved to ${tableName}` });
+    res.status(200).json({
+      status: 'success',
+      message: `${rows.length} rows saved to ${tableName}`,
+    });
+
   } catch (error) {
     console.error('🔴 [ERROR] Failed to insert data:', error);
-    res.status(500).json({ error: 'Failed to insert parsed CSV data', details: error.message });
+    res.status(500).json({ error: 'Failed to insert CSV data', details: error.message });
   } finally {
     try {
       await client.end();
