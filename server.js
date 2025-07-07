@@ -48,23 +48,18 @@ app.post('/postgres/ingest', async (req, res) => {
 
     if (rows.length === 0) throw new Error('CSV is empty');
 
-    // Rename 'Id' to 'objectname_id'
-    const objectIdColumnName = `${tableName}_id`;
-
-    const originalHeaders = Object.keys(rows[0]);
+    // Normalize headers and map them
+    const firstRow = rows[0];
     const headerMap = {};
-
-    const normalizedHeaders = originalHeaders.map((h) => {
-      let clean = h.toLowerCase().replace(/[^a-z0-9_]/gi, '_');
-      if (clean === 'id') {
-        clean = objectIdColumnName;
-      }
-      headerMap[h] = clean;
-      return clean;
+    const normalizedHeaders = Object.keys(firstRow).map((originalHeader) => {
+      let cleanHeader = originalHeader.toLowerCase().replace(/[^a-z0-9_]/gi, '_');
+      if (cleanHeader === 'id') cleanHeader = `${tableName}_id`;
+      headerMap[originalHeader] = cleanHeader;
+      return cleanHeader;
     });
 
-    // Build CREATE TABLE SQL
-    const columnDefinitions = normalizedHeaders.map((col) => `"${col}" TEXT`);
+    // Create table if not exists
+    const columnDefinitions = normalizedHeaders.map(col => `"${col}" TEXT`);
     const createTableQuery = `
       CREATE TABLE IF NOT EXISTS "${tableName}" (
         ${columnDefinitions.join(', ')},
@@ -74,14 +69,14 @@ app.post('/postgres/ingest', async (req, res) => {
     await client.query(createTableQuery);
     console.log(`🛠️ [DEBUG] Created/ensured table "${tableName}" with fields: ${normalizedHeaders.join(', ')}`);
 
-    // Insert data
+    // Insert each row
     for (const row of rows) {
       const columns = [];
       const values = [];
       const placeholders = [];
 
       let i = 1;
-      for (const originalKey of originalHeaders) {
+      for (const originalKey of Object.keys(firstRow)) {
         const normalizedKey = headerMap[originalKey];
         columns.push(`"${normalizedKey}"`);
         values.push(row[originalKey]);
@@ -90,7 +85,7 @@ app.post('/postgres/ingest', async (req, res) => {
 
       const insertQuery = `
         INSERT INTO "${tableName}" (${columns.join(', ')})
-        VALUES (${placeholders.join(', ')})
+        VALUES (${placeholders.join(', ')});
       `;
       await client.query(insertQuery, values);
     }
