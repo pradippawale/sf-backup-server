@@ -5,23 +5,26 @@ const { Readable } = require('stream');
 const csv = require('csv-parser');
 
 const app = express();
-app.use(bodyParser.json({ limit: '10mb' }));
+app.use(bodyParser.json({ limit: '20mb' })); // increase limit if needed
 
 app.post('/postgres/ingest', async (req, res) => {
   console.log('🔵 [DEBUG] Ingest API hit');
 
-  const { objectName, csvData } = req.body;
+  const { objectName, csvData, csvDataBase64 } = req.body;
 
-  if (!objectName || !csvData) {
-    console.error('🔴 [ERROR] Missing objectName or csvData in request body');
-    return res.status(400).json({ error: 'Missing objectName or csvData' });
+  if (!objectName || (!csvData && !csvDataBase64)) {
+    console.error('🔴 [ERROR] Missing objectName or CSV data');
+    return res.status(400).json({ error: 'Missing objectName or CSV data (csvData or csvDataBase64)' });
   }
 
   const tableName = objectName.toLowerCase().replace(/[^a-z0-9_]/gi, '_');
   const objectIdColumnName = `${tableName}_id`;
 
+  const base64 = csvDataBase64 || Buffer.from(csvData).toString('base64');
+  const csvString = Buffer.from(base64, 'base64').toString('utf-8');
+
   console.log(`🟡 [DEBUG] Received object: ${objectName}`);
-  console.log(`🟡 [DEBUG] CSV size: ${csvData.length} characters`);
+  console.log(`🟡 [DEBUG] CSV decoded size: ${csvString.length} characters`);
 
   const client = new Client({
     user: 'sfdatabaseuser',
@@ -36,7 +39,7 @@ app.post('/postgres/ingest', async (req, res) => {
     await client.connect();
     console.log('🟢 [DEBUG] Connected to PostgreSQL ✅');
 
-    const csvStream = Readable.from([csvData]);
+    const csvStream = Readable.from([csvString]);
     const rows = [];
     await new Promise((resolve, reject) => {
       csvStream
@@ -76,7 +79,7 @@ app.post('/postgres/ingest', async (req, res) => {
         } else if (tableColumns.includes('id')) {
           clean = 'id';
         } else {
-          clean = objectIdColumnName; // default if table doesn't exist
+          clean = objectIdColumnName;
         }
       }
 
