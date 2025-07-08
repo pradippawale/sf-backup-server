@@ -1,6 +1,6 @@
 const express = require('express');
 const { Pool } = require('pg');
-const csvParse = require('csv-parse/lib/sync');
+const { parse } = require('csv-parse/sync');
 
 const router = express.Router();
 
@@ -51,7 +51,8 @@ router.post('/postgres/ingest', async (req, res) => {
       return res.status(400).json({ error: 'Missing objectName or csvData' });
     }
 
-    const records = csvParse(csvData, {
+    // ✅ Parse the CSV string into an array of objects
+    const records = parse(csvData, {
       columns: true,
       skip_empty_lines: true,
     });
@@ -64,8 +65,10 @@ router.post('/postgres/ingest', async (req, res) => {
     const tableName = objectName.toLowerCase() + '_backup';
     let objectIdColumnName = getObjectIdColumn(headers);
 
-    // STEP 1: CREATE TABLE IF NEEDED
+    // ✅ Check if table exists
     const exists = await tableExists(tableName);
+
+    // ✅ Create table if it does not exist
     if (!exists) {
       const columnDefinitions = headers.map(col => {
         if (col === objectIdColumnName) {
@@ -82,12 +85,12 @@ router.post('/postgres/ingest', async (req, res) => {
       await pool.query(createQuery);
       console.log(`🆕 Created table "${tableName}"`);
     } else {
-      // Table exists, check if it has a usable ID column
+      // ✅ If table exists, recheck if it has an ID column
       const existingCols = await getTableColumns(tableName);
       objectIdColumnName = getObjectIdColumn(existingCols);
     }
 
-    // STEP 2: INSERT DATA
+    // ✅ Prepare the insert statement
     const columns = headers.map(col => `"${col}"`);
     const placeholders = headers.map((_, i) => `$${i + 1}`);
 
@@ -100,6 +103,7 @@ router.post('/postgres/ingest', async (req, res) => {
       insertQuery += ` ON CONFLICT ("${objectIdColumnName}") DO NOTHING`;
     }
 
+    // ✅ Insert each record
     for (const row of records) {
       const values = headers.map(col => row[col] || null);
       await pool.query(insertQuery, values);
