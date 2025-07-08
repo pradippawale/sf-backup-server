@@ -5,26 +5,33 @@ const { Readable } = require('stream');
 const csv = require('csv-parser');
 
 const app = express();
-app.use(bodyParser.json({ limit: '20mb' })); // increase limit if needed
+app.use(bodyParser.json({ limit: '20mb' }));
 
 app.post('/postgres/ingest', async (req, res) => {
   console.log('🔵 [DEBUG] Ingest API hit');
 
-  const { objectName, csvData, csvDataBase64 } = req.body;
+  const { objectName, csvData, part, filename } = req.body;
 
-  if (!objectName || (!csvData && !csvDataBase64)) {
-    console.error('🔴 [ERROR] Missing objectName or CSV data');
-    return res.status(400).json({ error: 'Missing objectName or CSV data (csvData or csvDataBase64)' });
+  if (!objectName || !csvData) {
+    console.error('🔴 [ERROR] Missing objectName or csvData');
+    return res.status(400).json({ error: 'Missing objectName or csvData (base64-encoded)' });
   }
 
   const tableName = objectName.toLowerCase().replace(/[^a-z0-9_]/gi, '_');
   const objectIdColumnName = `${tableName}_id`;
 
-  const base64 = csvDataBase64 || Buffer.from(csvData).toString('base64');
-  const csvString = Buffer.from(base64, 'base64').toString('utf-8');
+  console.log(`🟡 [DEBUG] Received object: ${objectName}, file: ${filename}, part: ${part}`);
 
-  console.log(`🟡 [DEBUG] Received object: ${objectName}`);
-  console.log(`🟡 [DEBUG] CSV decoded size: ${csvString.length} characters`);
+  let csvString;
+  try {
+    csvString = Buffer.from(csvData, 'base64').toString('utf-8');
+  } catch (err) {
+    return res.status(400).json({ error: 'Invalid base64 csvData' });
+  }
+
+  if (!csvString || csvString.trim().length === 0) {
+    return res.status(400).json({ error: 'Decoded CSV is empty' });
+  }
 
   const client = new Client({
     user: 'sfdatabaseuser',
@@ -39,62 +46,42 @@ app.post('/postgres/ingest', async (req, res) => {
     await client.connect();
     console.log('🟢 [DEBUG] Connected to PostgreSQL ✅');
 
-    const csvStream = Readable.from([csvString]);
     const rows = [];
     await new Promise((resolve, reject) => {
-      csvStream
+      Readable.from([csvString])
         .pipe(csv())
         .on('data', (row) => rows.push(row))
         .on('end', resolve)
         .on('error', reject);
     });
 
+    if (rows.length === 0) throw new Error('Parsed CSV is empty');
     console.log(`📄 [DEBUG] Parsed ${rows.length} rows from CSV`);
-    if (rows.length === 0) throw new Error('CSV is empty');
 
     const originalHeaders = Object.keys(rows[0]);
     const headerMap = {};
     let tableColumns = [];
 
-    // Step 1: Check if table already exists and get existing columns
-    const checkTableQuery = `
-      SELECT column_name
-      FROM information_schema.columns
-      WHERE table_name = $1
-    `;
-    try {
-      const result = await client.query(checkTableQuery, [tableName]);
-      tableColumns = result.rows.map((row) => row.column_name);
-    } catch (err) {
-      console.warn(`⚠️ [WARNING] Could not check columns for "${tableName}"`, err);
-    }
+    const checkTableQuery = `SELECT column_name FROM information_schema.columns WHERE table_name = $1`;
+    const result = await client.query(checkTableQuery, [tableName]);
+    tableColumns = result.rows.map((row) => row.column_name);
 
-    // Step 2: Normalize headers and resolve "Id" properly
     const normalizedHeaders = originalHeaders.map((h) => {
       let clean = h.toLowerCase().replace(/[^a-z0-9_]/gi, '_');
-
       if (clean === 'id') {
-        if (tableColumns.includes(objectIdColumnName)) {
-          clean = objectIdColumnName;
-        } else if (tableColumns.includes('id')) {
-          clean = 'id';
-        } else {
-          clean = objectIdColumnName;
-        }
+        clean = tableColumns.includes(objectIdColumnName) ? objectIdColumnName :
+                tableColumns.includes('id') ? 'id' : objectIdColumnName;
       }
-
       headerMap[h] = clean;
       return clean;
     });
 
-    // Step 3: Determine which field to use for uniqueness
     const uniqueKey = tableColumns.includes(objectIdColumnName)
       ? objectIdColumnName
       : tableColumns.includes('id')
         ? 'id'
         : normalizedHeaders.find(h => h === objectIdColumnName || h === 'id');
 
-    // Step 4: Create table if not exists with proper schema and UNIQUE constraint
     const columnDefinitions = normalizedHeaders.map((col) => `"${col}" TEXT`);
     const uniqueConstraint = uniqueKey ? `, UNIQUE("${uniqueKey}")` : '';
 
@@ -106,11 +93,9 @@ app.post('/postgres/ingest', async (req, res) => {
       );
     `;
     await client.query(createTableQuery);
-    console.log(`🛠️ [DEBUG] Created/ensured table "${tableName}" with UNIQUE on "${uniqueKey}"`);
+    console.log(`🛠️ [DEBUG] Table ensured: "${tableName}" with UNIQUE("${uniqueKey}")`);
 
-    // Step 5: Insert rows with ON CONFLICT DO NOTHING
     let insertedCount = 0;
-
     for (const row of rows) {
       const columns = [];
       const values = [];
@@ -118,8 +103,8 @@ app.post('/postgres/ingest', async (req, res) => {
 
       let i = 1;
       for (const originalKey of originalHeaders) {
-        const normalizedKey = headerMap[originalKey];
-        columns.push(`"${normalizedKey}"`);
+        const normKey = headerMap[originalKey];
+        columns.push(`"${normKey}"`);
         values.push(row[originalKey]);
         placeholders.push(`$${i++}`);
       }
@@ -129,27 +114,27 @@ app.post('/postgres/ingest', async (req, res) => {
         VALUES (${placeholders.join(', ')})
       `;
 
-      if (uniqueKey) {
-        insertQuery += ` ON CONFLICT ("${uniqueKey}") DO NOTHING`;
-      }
+      if (uniqueKey) insertQuery += ` ON CONFLICT ("${uniqueKey}") DO NOTHING`;
 
       const result = await client.query(insertQuery, values);
       if (result.rowCount > 0) insertedCount++;
     }
 
-    console.log(`✅ [DEBUG] Inserted ${insertedCount} of ${rows.length} rows into "${tableName}"`);
-    res.status(200).json({ status: 'success', message: `${insertedCount} new rows saved to ${tableName}` });
+    console.log(`✅ [DEBUG] Inserted ${insertedCount} of ${rows.length} rows (part ${part})`);
+    res.status(200).json({
+      status: 'success',
+      part,
+      filename,
+      inserted: insertedCount,
+      total: rows.length
+    });
 
   } catch (error) {
-    console.error('🔴 [ERROR] Failed to insert data:', error);
-    res.status(500).json({ error: 'Failed to insert parsed CSV data', details: error.message });
+    console.error('🔴 [ERROR] Failed during processing:', error);
+    res.status(500).json({ error: 'Failed to process CSV chunk', details: error.message });
   } finally {
-    try {
-      await client.end();
-      console.log('🔵 [DEBUG] PostgreSQL connection closed');
-    } catch (err) {
-      console.error('🔴 [ERROR] Error while closing connection:', err);
-    }
+    await client.end().catch(err => console.error('🔴 [ERROR] Closing DB connection:', err));
+    console.log('🔵 [DEBUG] PostgreSQL connection closed');
   }
 });
 
