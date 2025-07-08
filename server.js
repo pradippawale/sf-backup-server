@@ -18,6 +18,8 @@ app.post('/postgres/ingest', async (req, res) => {
   }
 
   const tableName = objectName.toLowerCase().replace(/[^a-z0-9_]/gi, '_');
+  const objectIdColumnName = `${tableName}_id`;
+
   console.log(`🟡 [DEBUG] Received object: ${objectName}`);
   console.log(`🟡 [DEBUG] CSV size: ${csvData.length} characters`);
 
@@ -45,15 +47,13 @@ app.post('/postgres/ingest', async (req, res) => {
     });
 
     console.log(`📄 [DEBUG] Parsed ${rows.length} rows from CSV`);
-
     if (rows.length === 0) throw new Error('CSV is empty');
 
-    const objectIdColumnName = `${tableName}_id`;
     const originalHeaders = Object.keys(rows[0]);
     const headerMap = {};
     let tableColumns = [];
 
-    // Step 1: Check existing columns if table already exists
+    // Step 1: Check if table already exists and get existing columns
     const checkTableQuery = `
       SELECT column_name
       FROM information_schema.columns
@@ -66,25 +66,35 @@ app.post('/postgres/ingest', async (req, res) => {
       console.warn(`⚠️ [WARNING] Could not check columns for "${tableName}"`, err);
     }
 
-    // Step 2: Normalize headers and optionally rename "Id"
+    // Step 2: Normalize headers and resolve "Id" properly
     const normalizedHeaders = originalHeaders.map((h) => {
       let clean = h.toLowerCase().replace(/[^a-z0-9_]/gi, '_');
-      if (
-        clean === 'id' &&
-        !tableColumns.includes('id') &&
-        !tableColumns.includes(objectIdColumnName)
-      ) {
-        clean = objectIdColumnName;
+
+      if (clean === 'id') {
+        if (tableColumns.includes(objectIdColumnName)) {
+          clean = objectIdColumnName;
+        } else if (tableColumns.includes('id')) {
+          clean = 'id';
+        } else {
+          clean = objectIdColumnName; // default if table doesn't exist
+        }
       }
+
       headerMap[h] = clean;
       return clean;
     });
 
-    // Step 3: Create table with UNIQUE constraint on object ID
-    const uniqueKey = normalizedHeaders.find(h => h === 'id' || h === objectIdColumnName);
+    // Step 3: Determine which field to use for uniqueness
+    const uniqueKey = tableColumns.includes(objectIdColumnName)
+      ? objectIdColumnName
+      : tableColumns.includes('id')
+        ? 'id'
+        : normalizedHeaders.find(h => h === objectIdColumnName || h === 'id');
+
+    // Step 4: Create table if not exists with proper schema and UNIQUE constraint
+    const columnDefinitions = normalizedHeaders.map((col) => `"${col}" TEXT`);
     const uniqueConstraint = uniqueKey ? `, UNIQUE("${uniqueKey}")` : '';
 
-    const columnDefinitions = normalizedHeaders.map((col) => `"${col}" TEXT`);
     const createTableQuery = `
       CREATE TABLE IF NOT EXISTS "${tableName}" (
         ${columnDefinitions.join(', ')},
@@ -95,8 +105,9 @@ app.post('/postgres/ingest', async (req, res) => {
     await client.query(createTableQuery);
     console.log(`🛠️ [DEBUG] Created/ensured table "${tableName}" with UNIQUE on "${uniqueKey}"`);
 
-    // Step 4: Insert each row with conflict handling
+    // Step 5: Insert rows with ON CONFLICT DO NOTHING
     let insertedCount = 0;
+
     for (const row of rows) {
       const columns = [];
       const values = [];
